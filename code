@@ -1,0 +1,349 @@
+/* ============================================================
+   Real-Time Disaster-Relief Material Distribution System
+   Graph (Warehouses <-> Zones) + Dijkstra (nearest-route distance)
+   + Priority Queue (Binary Heap) for urgency/priority-based dispatch
+   + Two prioritization strategies compared: URGENCY-FIRST vs HYBRID
+   ============================================================ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <limits.h>
+
+#define MAX_NODES     20      /* warehouses + zones combined      */
+#define MAX_ZONES     10
+#define MAX_WAREHOUSES 5
+#define INF           INT_MAX
+
+/* ---------- Graph representation (weighted adjacency list) ---------- */
+typedef struct EdgeNode {
+    int dest;
+    int weight;              /* distance / travel cost in km      */
+    int capacity;            /* max units transportable per trip  */
+    struct EdgeNode *next;
+} EdgeNode;
+
+typedef struct {
+    char name[30];
+    int  isWarehouse;        /* 1 = warehouse, 0 = disaster zone  */
+    int  stock;               /* warehouse stock (if warehouse)    */
+    int  demand;               /* zone demand (if zone)             */
+    int  urgency;              /* zone urgency 1-10 (if zone)       */
+    int  fulfilled;            /* units delivered so far            */
+    int  waitCycles;           /* cycles zone has been waiting      */
+} Node;
+
+Node nodes[MAX_NODES];
+EdgeNode *adjList[MAX_NODES];
+int numNodes = 0;
+
+void addNode(const char *name, int isWarehouse, int stock, int demand, int urgency) {
+    strcpy(nodes[numNodes].name, name);
+    nodes[numNodes].isWarehouse = isWarehouse;
+    nodes[numNodes].stock = stock;
+    nodes[numNodes].demand = demand;
+    nodes[numNodes].urgency = urgency;
+    nodes[numNodes].fulfilled = 0;
+    nodes[numNodes].waitCycles = 0;
+    adjList[numNodes] = NULL;
+    numNodes++;
+}
+
+void addEdge(int src, int dest, int weight, int capacity) {
+    EdgeNode *e1 = malloc(sizeof(EdgeNode));
+    e1->dest = dest; e1->weight = weight; e1->capacity = capacity;
+    e1->next = adjList[src]; adjList[src] = e1;
+
+    EdgeNode *e2 = malloc(sizeof(EdgeNode));
+    e2->dest = src; e2->weight = weight; e2->capacity = capacity;
+    e2->next = adjList[dest]; adjList[dest] = e2;
+}
+
+/* ---------- Dijkstra: shortest transport distance from a warehouse ---------- */
+void dijkstra(int src, int dist[]) {
+    int visited[MAX_NODES] = {0};
+    for (int i = 0; i < numNodes; i++) dist[i] = INF;
+    dist[src] = 0;
+
+    for (int count = 0; count < numNodes - 1; count++) {
+        int u = -1, best = INF;
+        for (int v = 0; v < numNodes; v++)
+            if (!visited[v] && dist[v] < best) { best = dist[v]; u = v; }
+        if (u == -1) break;
+        visited[u] = 1;
+
+        for (EdgeNode *e = adjList[u]; e; e = e->next)
+            if (!visited[e->dest] && dist[u] != INF &&
+                dist[u] + e->weight < dist[e->dest])
+                dist[e->dest] = dist[u] + e->weight;
+    }
+}
+
+/* nearest warehouse (with available stock) to a given zone */
+int nearestWarehouse(int zoneIdx, int *outDistance) {
+    int best = -1, bestDist = INF;
+    for (int w = 0; w < numNodes; w++) {
+        if (!nodes[w].isWarehouse || nodes[w].stock <= 0) continue;
+        int dist[MAX_NODES];
+        dijkstra(w, dist);
+        if (dist[zoneIdx] < bestDist) { bestDist = dist[zoneIdx]; best = w; }
+    }
+    *outDistance = bestDist;
+    return best;
+}
+
+/* ---------- Priority score (used by the HYBRID strategy) ---------- */
+/* Higher score = dispatched first. Weighted combination of urgency,
+   unmet demand, closeness, and anti-starvation aging term.          */
+double priorityScore(int zoneIdx, int distance) {
+    Node z = nodes[zoneIdx];
+    int unmet = z.demand - z.fulfilled;
+    double urgencyTerm  = z.urgency * 10.0;          /* weight 10 */
+    double demandTerm   = unmet * 0.5;                /* weight 0.5 */
+    double distanceTerm = (distance == INF) ? 0 : (100.0 / (distance + 1)); /* closer = higher */
+    double agingTerm    = z.waitCycles * 3.0;         /* prevents starvation */
+    return urgencyTerm + demandTerm + distanceTerm + agingTerm;
+}
+
+/* ---------- Max-Heap priority queue ---------- */
+typedef struct {
+    int zoneIdx;
+    int distance;
+    double score;
+} PQItem;
+
+PQItem heap[MAX_NODES];
+int heapSize = 0;
+
+void swapPQ(PQItem *a, PQItem *b) { PQItem t = *a; *a = *b; *b = t; }
+
+void heapPush(PQItem item) {
+    int i = heapSize++;
+    heap[i] = item;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (heap[p].score >= heap[i].score) break;
+        swapPQ(&heap[p], &heap[i]);
+        i = p;
+    }
+}
+
+PQItem heapPop(void) {
+    PQItem top = heap[0];
+    heap[0] = heap[--heapSize];
+    int i = 0;
+    while (1) {
+        int l = 2*i+1, r = 2*i+2, largest = i;
+        if (l < heapSize && heap[l].score > heap[largest].score) largest = l;
+        if (r < heapSize && heap[r].score > heap[largest].score) largest = r;
+        if (largest == i) break;
+        swapPQ(&heap[i], &heap[largest]);
+        i = largest;
+    }
+    return top;
+}
+
+void heapClear(void) { heapSize = 0; }
+
+/* ---------- Reset all zone fulfilment / wait counters between strategy runs ---------- */
+void resetState(int savedStock[]) {
+    for (int i = 0; i < numNodes; i++) {
+        nodes[i].fulfilled = 0;
+        nodes[i].waitCycles = 0;
+        if (nodes[i].isWarehouse) nodes[i].stock = savedStock[i];
+    }
+}
+
+/* ---------- Run one full dispatch simulation under a given strategy ---------- */
+/* strategy: 0 = URGENCY-FIRST, 1 = DEMAND-FIRST, 2 = HYBRID WEIGHTED */
+void runStrategy(int strategy, const char *label) {
+    printf("\n================ STRATEGY: %s ================\n", label);
+    heapClear();
+
+    int round = 1;
+    int anyPending = 1;
+
+    while (anyPending) {
+        anyPending = 0;
+        heapClear();
+
+        /* Build the priority queue for this dispatch round */
+        for (int i = 0; i < numNodes; i++) {
+            if (nodes[i].isWarehouse) continue;
+            int unmet = nodes[i].demand - nodes[i].fulfilled;
+            if (unmet <= 0) continue;
+
+            int dist;
+            int wh = nearestWarehouse(i, &dist);
+            if (wh == -1) continue;   /* no warehouse has stock left */
+
+            double score;
+            if (strategy == 0)      score = nodes[i].urgency * 10.0 + nodes[i].waitCycles * 3.0;
+            else if (strategy == 1) score = unmet * 1.0 + nodes[i].waitCycles * 3.0;
+            else                    score = priorityScore(i, dist);
+
+            PQItem item = { i, dist, score };
+            heapPush(item);
+            anyPending = 1;
+        }
+
+        if (!anyPending) break;
+
+        printf("\n-- Dispatch Round %d --\n", round++);
+        while (heapSize > 0) {
+            PQItem top = heapPop();
+            int z = top.zoneIdx;
+            int unmet = nodes[z].demand - nodes[z].fulfilled;
+            int dist;
+            int wh = nearestWarehouse(z, &dist);
+            if (wh == -1) continue;
+
+            int deliver = unmet < nodes[wh].stock ? unmet : nodes[wh].stock;
+            if (deliver <= 0) continue;
+
+            nodes[wh].stock     -= deliver;
+            nodes[z].fulfilled  += deliver;
+            printf("  Dispatch: %-10s -> %-10s | Qty:%4d | Dist:%3d km | Score:%6.1f | Remaining Need:%4d\n",
+                   nodes[wh].name, nodes[z].name, deliver, dist, top.score,
+                   nodes[z].demand - nodes[z].fulfilled);
+        }
+
+        /* age all zones that still have unmet demand (anti-starvation) */
+        for (int i = 0; i < numNodes; i++)
+            if (!nodes[i].isWarehouse && nodes[i].fulfilled < nodes[i].demand)
+                nodes[i].waitCycles++;
+
+        /* --- Dynamic re-prioritization event: after round 1, an aftershock
+               is reported near Zone-D, escalating its urgency. The system
+               must re-evaluate priorities on the very next round using the
+               updated field, demonstrating support for dynamic urgency. --- */
+        if (round == 2) {
+            for (int i = 0; i < numNodes; i++) {
+                if (!nodes[i].isWarehouse && strcmp(nodes[i].name, "Zone-D") == 0 &&
+                    nodes[i].fulfilled < nodes[i].demand) {
+                    printf("\n  [EVENT] Aftershock reported near Zone-D -> urgency escalated 3 -> 9 (re-prioritized for next round)\n");
+                    nodes[i].urgency = 9;
+                }
+            }
+        }
+
+        if (round > 10) break;  /* safety guard for the simulation */
+    }
+
+    /* Summary metrics for this strategy */
+    int totalDemand = 0, totalFulfilled = 0, zonesFullyServed = 0;
+    int maxWait = 0;
+    double avgUrgencyServedFirst = 0;
+    for (int i = 0; i < numNodes; i++) {
+        if (nodes[i].isWarehouse) continue;
+        totalDemand    += nodes[i].demand;
+        totalFulfilled += nodes[i].fulfilled;
+        if (nodes[i].fulfilled >= nodes[i].demand) zonesFullyServed++;
+        if (nodes[i].waitCycles > maxWait) maxWait = nodes[i].waitCycles;
+    }
+    printf("\n-- Summary (%s) --\n", label);
+    printf("  Total Demand        : %d units\n", totalDemand);
+    printf("  Total Fulfilled     : %d units (%.1f%%)\n", totalFulfilled,
+           100.0 * totalFulfilled / totalDemand);
+    int totalZones = 0;
+    for (int i = 0; i < numNodes; i++) if (!nodes[i].isWarehouse) totalZones++;
+    printf("  Zones Fully Served  : %d / %d\n", zonesFullyServed, totalZones);
+    printf("  Zones With Zero Delivery: ");
+    int anyZero = 0;
+    for (int i = 0; i < numNodes; i++)
+        if (!nodes[i].isWarehouse && nodes[i].fulfilled == 0) { printf("%s ", nodes[i].name); anyZero = 1; }
+    if (!anyZero) printf("None");
+    printf("\n");
+    printf("  Max Wait Cycles (fairness indicator, lower=better): %d\n", maxWait);
+    printf("  Dispatch Rounds Used: %d\n", round - 1);
+}
+
+/* ---------- Performance test: heap push/pop under increasing load ---------- */
+void performanceTest(void) {
+    int sizes[] = {100, 500, 1000, 5000, 10000};
+    printf("\n=== PRIORITY QUEUE PERFORMANCE TEST (push+pop) ===\n");
+    printf("Requests\tTime(sec)\n");
+    for (int s = 0; s < 5; s++) {
+        heapClear();
+        clock_t start = clock();
+        for (int i = 0; i < sizes[s] && i < MAX_NODES; i++) {
+            /* MAX_NODES limits real heap size; this measures op cost at scale
+               by repeating push/pop cycles to simulate sustained load */
+        }
+        srand(42);
+        int n = sizes[s];
+        PQItem *tmp = malloc(sizeof(PQItem) * n);
+        int cap = 0;
+        for (int i = 0; i < n; i++) {
+            PQItem it = { 0, 0, (double)(rand() % 100000) };
+            if (cap < n) { tmp[cap++] = it; }
+            int idx = cap - 1;
+            while (idx > 0) {
+                int p = (idx - 1) / 2;
+                if (tmp[p].score >= tmp[idx].score) break;
+                PQItem t = tmp[p]; tmp[p] = tmp[idx]; tmp[idx] = t;
+                idx = p;
+            }
+        }
+        while (cap > 0) {
+            tmp[0] = tmp[--cap];
+            int idx = 0;
+            while (1) {
+                int l = 2*idx+1, r = 2*idx+2, largest = idx;
+                if (l < cap && tmp[l].score > tmp[largest].score) largest = l;
+                if (r < cap && tmp[r].score > tmp[largest].score) largest = r;
+                if (largest == idx) break;
+                PQItem t = tmp[idx]; tmp[idx] = tmp[largest]; tmp[largest] = t;
+                idx = largest;
+            }
+        }
+        free(tmp);
+        clock_t end = clock();
+        printf("%d\t\t%.6f\n", sizes[s], (double)(end - start) / CLOCKS_PER_SEC);
+    }
+}
+
+int main(void) {
+    /* ---- Build the network: 3 warehouses, 6 disaster zones ---- */
+    addNode("WH-North", 1, 150, 0, 0);
+    addNode("WH-East",  1, 100, 0, 0);
+    addNode("WH-South", 1,  90, 0, 0);
+
+    addNode("Zone-A", 0, 0, 120, 9);   /* flood, high urgency, moderate demand */
+    addNode("Zone-B", 0, 0, 200, 4);   /* large population, low urgency        */
+    addNode("Zone-C", 0, 0,  80, 10);  /* earthquake epicenter, critical, small*/
+    addNode("Zone-D", 0, 0,  60, 3);   /* low urgency, low demand              */
+    addNode("Zone-E", 0, 0, 100, 7);   /* fire spreading, moderate-high        */
+    addNode("Zone-F", 0, 0, 140, 5);   /* moderate urgency, large demand       */
+
+    /* indices: 0=WH-North 1=WH-East 2=WH-South 3=A 4=B 5=C 6=D 7=E 8=F */
+    addEdge(0, 3, 12, 50);   addEdge(0, 4, 20, 40);
+    addEdge(1, 5, 8,  60);   addEdge(1, 7, 15, 30);
+    addEdge(2, 6, 10, 40);   addEdge(2, 8, 18, 35);
+    addEdge(0, 5, 25, 20);   addEdge(1, 4, 22, 20);
+    addEdge(1, 6, 30, 15);   addEdge(2, 7, 27, 15);
+    addEdge(0, 8, 33, 10);   addEdge(2, 3, 28, 10);
+
+    int savedStock[MAX_NODES];
+    for (int i = 0; i < numNodes; i++) savedStock[i] = nodes[i].stock;
+
+    printf("====================================================\n");
+    printf(" REAL-TIME DISASTER-RELIEF DISTRIBUTION ENGINE\n");
+    printf(" Warehouses: 3   Disaster Zones: 6   Total Nodes: %d\n", numNodes);
+    printf("====================================================\n");
+
+    runStrategy(0, "URGENCY-FIRST");
+    resetState(savedStock);
+
+    runStrategy(2, "HYBRID WEIGHTED (Urgency+Demand+Distance+Aging)");
+    resetState(savedStock);
+
+    runStrategy(1, "DEMAND-FIRST");
+    resetState(savedStock);
+
+    performanceTest();
+
+    printf("\nProgram finished successfully.\n");
+    return 0;
+}
